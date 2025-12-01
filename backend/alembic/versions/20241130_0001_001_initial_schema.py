@@ -121,7 +121,7 @@ def upgrade() -> None:
     )
     op.create_index('idx_lsoa_code', 'lsoa', ['lsoa_code'])
     op.create_index('idx_lsoa_icb', 'lsoa', ['icb_code'])
-    op.create_index('idx_lsoa_geometry', 'lsoa', ['geometry'], postgresql_using='gist')
+    # Note: GeoAlchemy2 automatically creates GIST index on geometry columns
 
     # IMD Data table
     op.create_table(
@@ -294,7 +294,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(['organization_id'], ['organizations.id']),
         sa.PrimaryKeyConstraint('id')
     )
-    op.create_index('idx_visit_loc_geo', 'visit_locations', ['location'], postgresql_using='gist')
+    # Note: GeoAlchemy2 automatically creates GIST index on geometry columns
     op.create_index('idx_visit_loc_lsoa', 'visit_locations', ['lsoa_id'])
 
     # Route Plans table

@@ -1,11 +1,14 @@
 """Authentication endpoints - JWT + Google OAuth 2.0."""
 
-from datetime import timedelta
+from datetime import datetime, timezone
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.security import (
@@ -17,6 +20,8 @@ from app.core.security import (
     verify_refresh_token,
 )
 from app.core.exceptions import UnauthorizedError
+from app.models.base import get_db
+from app.models.organization import User
 
 router = APIRouter()
 
@@ -76,29 +81,45 @@ class UserResponse(BaseModel):
 
 
 # ============================================
-# TEMPORARY IN-MEMORY USER STORE
+# DATABASE HELPERS
 # ============================================
-# TODO: Replace with database queries
-
-_temp_users: dict[str, dict] = {}
 
 
-def get_user_by_email(email: str) -> dict | None:
-    """Get user by email from temporary store."""
-    return _temp_users.get(email)
+def get_user_by_email(db: Session, email: str) -> User | None:
+    """Get user by email from database."""
+    return db.execute(select(User).where(User.email == email)).scalar_one_or_none()
 
 
-def create_user(email: str, password: str, full_name: str) -> dict:
-    """Create user in temporary store."""
-    user = {
-        "id": str(len(_temp_users) + 1),
-        "email": email,
-        "password_hash": get_password_hash(password),
-        "full_name": full_name,
-        "role": "PLANNER",
-        "is_active": True,
-    }
-    _temp_users[email] = user
+def get_user_by_id(db: Session, user_id: UUID) -> User | None:
+    """Get user by ID from database."""
+    return db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+
+
+def get_user_by_google_id(db: Session, google_id: str) -> User | None:
+    """Get user by Google ID from database."""
+    return db.execute(select(User).where(User.google_id == google_id)).scalar_one_or_none()
+
+
+def create_user_in_db(
+    db: Session,
+    email: str,
+    full_name: str,
+    password: str | None = None,
+    google_id: str | None = None,
+    role: str = "PLANNER",
+) -> User:
+    """Create user in database."""
+    user = User(
+        email=email,
+        password_hash=get_password_hash(password) if password else None,
+        full_name=full_name,
+        role=role,
+        google_id=google_id,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return user
 
 
@@ -108,52 +129,63 @@ def create_user(email: str, password: str, full_name: str) -> dict:
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate) -> UserResponse:
+async def register(
+    user_data: UserCreate,
+    db: Session = Depends(get_db),
+) -> UserResponse:
     """Register a new user with email and password."""
-    if get_user_by_email(user_data.email):
+    if get_user_by_email(db, user_data.email):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User with this email already exists",
         )
 
-    user = create_user(
+    user = create_user_in_db(
+        db=db,
         email=user_data.email,
         password=user_data.password,
         full_name=user_data.full_name,
     )
 
     return UserResponse(
-        id=user["id"],
-        email=user["email"],
-        full_name=user["full_name"],
-        role=user["role"],
-        is_active=user["is_active"],
+        id=str(user.id),
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+        is_active=user.is_active,
     )
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> TokenResponse:
+async def login(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Session = Depends(get_db),
+) -> TokenResponse:
     """Login with email and password, returns JWT tokens."""
-    user = get_user_by_email(form_data.username)
+    user = get_user_by_email(db, form_data.username)
 
-    if not user or not verify_password(form_data.password, user["password_hash"]):
+    if not user or not user.password_hash or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not user["is_active"]:
+    if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is disabled",
         )
 
+    # Update last login
+    user.last_login = datetime.now(timezone.utc)
+    db.commit()
+
     access_token = create_access_token(
-        subject=user["id"],
-        additional_claims={"email": user["email"], "role": user["role"]},
+        subject=str(user.id),
+        additional_claims={"email": user.email, "role": user.role},
     )
-    refresh_token = create_refresh_token(subject=user["id"])
+    refresh_token = create_refresh_token(subject=str(user.id))
 
     return TokenResponse(
         access_token=access_token,
@@ -163,16 +195,28 @@ async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> T
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(token_data: TokenRefresh) -> TokenResponse:
+async def refresh_token(
+    token_data: TokenRefresh,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
     """Refresh access token using refresh token."""
     try:
         payload = verify_refresh_token(token_data.refresh_token)
         user_id = payload.get("sub")
 
-        # TODO: Verify user still exists and is active in database
+        # Verify user still exists and is active
+        user = get_user_by_id(db, UUID(user_id))
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found or inactive",
+            )
 
-        access_token = create_access_token(subject=user_id)
-        new_refresh_token = create_refresh_token(subject=user_id)
+        access_token = create_access_token(
+            subject=str(user.id),
+            additional_claims={"email": user.email, "role": user.role},
+        )
+        new_refresh_token = create_refresh_token(subject=str(user.id))
 
         return TokenResponse(
             access_token=access_token,
@@ -187,7 +231,10 @@ async def refresh_token(token_data: TokenRefresh) -> TokenResponse:
 
 
 @router.post("/google", response_model=TokenResponse)
-async def google_auth(auth_data: GoogleAuthRequest) -> TokenResponse:
+async def google_auth(
+    auth_data: GoogleAuthRequest,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
     """
     Authenticate with Google OAuth 2.0.
 
@@ -202,7 +249,7 @@ async def google_auth(auth_data: GoogleAuthRequest) -> TokenResponse:
     # TODO: Implement Google OAuth flow
     # 1. Exchange code for Google tokens
     # 2. Fetch user info from Google
-    # 3. Create or update user in database
+    # 3. Create or update user in database using get_user_by_google_id / create_user_in_db
     # 4. Return JWT tokens
 
     raise HTTPException(
@@ -212,19 +259,16 @@ async def google_auth(auth_data: GoogleAuthRequest) -> TokenResponse:
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> UserResponse:
+async def get_current_user(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    db: Session = Depends(get_db),
+) -> UserResponse:
     """Get current authenticated user."""
     try:
         payload = verify_access_token(token)
         user_id = payload.get("sub")
-        email = payload.get("email")
 
-        # TODO: Fetch user from database
-        user = None
-        for u in _temp_users.values():
-            if u["id"] == user_id:
-                user = u
-                break
+        user = get_user_by_id(db, UUID(user_id))
 
         if not user:
             raise HTTPException(
@@ -233,11 +277,11 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Use
             )
 
         return UserResponse(
-            id=user["id"],
-            email=user["email"],
-            full_name=user["full_name"],
-            role=user["role"],
-            is_active=user["is_active"],
+            id=str(user.id),
+            email=user.email,
+            full_name=user.full_name,
+            role=user.role,
+            is_active=user.is_active,
         )
     except UnauthorizedError as e:
         raise HTTPException(
